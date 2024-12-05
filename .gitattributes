@@ -1,2 +1,116 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+-- Step 1: Create a table from Facebook Ads data with COALESCE to handle NULL values
+WITH new_table AS (
+    SELECT 
+        ad_date, -- The date of the ad activity
+        url_parameters, -- URL parameters for tracking UTM campaign
+        COALESCE(spend, 0) AS spend, -- Ad spend (default to 0 if NULL)
+        COALESCE(impressions, 0) AS impressions, -- Number of impressions
+        COALESCE(reach, 0) AS reach, -- Number of unique users reached
+        COALESCE(clicks, 0) AS clicks, -- Number of clicks
+        COALESCE(leads, 0) AS leads, -- Number of leads generated
+        COALESCE(value, 0) AS value -- Value of conversions
+    FROM facebook_ads_basic_daily
+    JOIN facebook_adset 
+        ON facebook_ads_basic_daily.adset_id = facebook_adset.adset_id -- Join with adset table
+    JOIN facebook_campaign 
+        ON facebook_ads_basic_daily.campaign_id = facebook_campaign.campaign_id -- Join with campaign table
+),
+
+-- Step 2: Create a table from Google Ads data with COALESCE to handle NULL values
+new_table_2 AS (
+    SELECT 
+        ad_date, -- The date of the ad activity
+        url_parameters, -- URL parameters for tracking UTM campaign
+        COALESCE(spend, 0) AS spend, -- Ad spend
+        COALESCE(impressions, 0) AS impressions, -- Number of impressions
+        COALESCE(reach, 0) AS reach, -- Number of unique users reached
+        COALESCE(clicks, 0) AS clicks, -- Number of clicks
+        COALESCE(leads, 0) AS leads, -- Number of leads generated
+        COALESCE(value, 0) AS value -- Value of conversions
+    FROM google_ads_basic_daily
+),
+
+-- Step 3: Combine Facebook and Google Ads data into a single table
+new_table_3 AS (
+    SELECT * FROM new_table
+    UNION ALL
+    SELECT * FROM new_table_2 -- Union all records from Facebook and Google Ads
+),
+
+-- Step 4: Aggregate data by month and campaign, calculating metrics
+new_table_4 AS (
+    SELECT 
+        DATE(DATE_TRUNC('month', ad_date)) AS ad_month, -- Extract the month from the ad date
+        SUBSTRING(url_parameters, 'utm_campaign=([^&]+)') AS utm_campaign, -- Extract UTM campaign from URL
+        SUM(spend) AS total_spend, -- Total ad spend per month and campaign
+        SUM(impressions) AS total_impressions, -- Total impressions
+        SUM(clicks) AS total_clicks, -- Total clicks
+        SUM(value) AS total_value, -- Total conversion value
+        CASE
+            WHEN SUM(impressions) = 0 THEN 0
+            ELSE SUM(clicks) * 1.0 / SUM(impressions) * 100 -- Calculate CTR
+        END AS CTR,
+        CASE
+            WHEN SUM(clicks) = 0 THEN 0
+            ELSE SUM(spend) * 1.0 / SUM(clicks) -- Calculate CPC
+        END AS CPC,
+        CASE
+            WHEN SUM(impressions) = 0 THEN 0
+            ELSE SUM(spend) * 1000.0 / SUM(impressions) -- Calculate CPM
+        END AS CPM,
+        CASE
+            WHEN SUM(spend) = 0 THEN 0
+            ELSE SUM(value) * 1.0 / SUM(spend) -- Calculate ROMI
+        END AS ROMI
+    FROM 
+        new_table_3 -- Use the combined data
+    GROUP BY 
+        DATE_TRUNC('month', ad_date), utm_campaign
+),
+
+-- Step 5: Add previous month's CPM, CTR, and ROMI values for each campaign
+final_table AS (
+    SELECT 
+        ad_month,
+        utm_campaign,
+        total_spend,
+        total_impressions,
+        total_clicks,
+        total_value,
+        CTR,
+        CPC,
+        CPM,
+        ROMI,
+        LAG(CPM) OVER (PARTITION BY utm_campaign ORDER BY ad_month) AS CPM_utm, -- Previous month's CPM
+        LAG(CTR) OVER (PARTITION BY utm_campaign ORDER BY ad_month) AS CTR_utm, -- Previous month's CTR
+        LAG(ROMI) OVER (PARTITION BY utm_campaign ORDER BY ad_month) AS ROMI_utm -- Previous month's ROMI
+    FROM new_table_4
+)
+
+-- Step 6: Calculate percentage changes and create the final output
+SELECT 
+    ad_month,
+    utm_campaign,
+    total_spend,
+    total_impressions,
+    total_clicks,
+    total_value,
+    CTR,
+    CPC,
+    CPM,
+    ROMI,
+    CASE 
+        WHEN CPM_utm IS NOT NULL AND CPM_utm != 0 THEN ((CPM - CPM_utm) / CPM_utm) * 100 -- CPM change %
+        ELSE NULL 
+    END AS CPM_change,
+    CASE 
+        WHEN CTR_utm IS NOT NULL AND CTR_utm != 0 THEN ((CTR - CTR_utm) / CTR_utm) * 100 -- CTR change %
+        ELSE NULL 
+    END AS CTR_change,
+    CASE 
+        WHEN ROMI_utm IS NOT NULL AND ROMI_utm != 0 THEN ((ROMI - ROMI_utm) / ROMI_utm) * 100 -- ROMI change %
+        ELSE NULL 
+    END AS ROMI_change
+FROM final_table 
+ORDER BY 
+    ad_month, utm_campaign; -- Sort by month and campaign
